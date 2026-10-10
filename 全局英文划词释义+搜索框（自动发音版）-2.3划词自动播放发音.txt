@@ -1,0 +1,300 @@
+// ==UserScript==
+// @name         全局英文划词释义+搜索框（自动发音版）
+// @namespace    http://tampermonkey.net/
+// @version      2.3 划词自动播放发音
+// @description  所有网页通用：划词/双击查词自动播美音 + 右上角搜索框，支持英美音标点击发音
+// @author       You
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ========== 发音函数 ==========
+    function playWordAudio(word, type) {
+        // type=2 美音，type=1 英音
+        const audio = new Audio(`https://dict.youdao.com/dictvoice?audio=${encodeURIComponent(word)}&type=${type}`);
+        audio.play().catch(e => {
+            console.error('[发音播放失败]', e);
+        });
+    }
+
+    // 统一绑定音标点击事件
+    function bindPhoneticEvents(container, word) {
+        const usPh = container.querySelector('.us-phonetic');
+        const ukPh = container.querySelector('.uk-phonetic');
+        if (usPh) {
+            usPh.addEventListener('click', (e) => {
+                e.stopPropagation();
+                playWordAudio(word, 2);
+            });
+        }
+        if (ukPh) {
+            ukPh.addEventListener('click', (e) => {
+                e.stopPropagation();
+                playWordAudio(word, 1);
+            });
+        }
+    }
+
+    // ========== 1. 划词跟随弹窗 ==========
+    const tip = document.createElement('div');
+    tip.style.cssText = `
+        position: fixed !important;
+        z-index: 999999 !important;
+        background: #ffffff !important;
+        border: 1px solid #d0d7de !important;
+        border-radius: 8px !important;
+        padding: 10px 12px !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+        max-width: 320px !important;
+        font-size: 14px !important;
+        line-height: 1.6 !important;
+        display: none !important;
+        color: #1f2328 !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif !important;
+        user-select: text !important;
+    `;
+    document.documentElement.appendChild(tip);
+
+    // ========== 2. 右上角搜索框 ==========
+    const searchPanel = document.createElement('div');
+    searchPanel.style.cssText = `
+        position: fixed !important;
+        top: 20px !important;
+        right: 20px !important;
+        z-index: 999999 !important;
+        background: #ffffff !important;
+        border: 1px solid #d0d7de !important;
+        border-radius: 8px !important;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+        width: 40px;
+        height: 40px;
+        transition: all 0.2s ease;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif !important;
+    `;
+    searchPanel.innerHTML = `
+        <div id="searchToggle" style="
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 18px;
+            color: #555;
+            user-select: none;
+        ">🔍</div>
+        <div id="searchBody" style="padding: 0 12px 12px; display: none;">
+            <input id="wordInput" type="text" placeholder="输入英文单词回车搜索" style="
+                width: 100%;
+                box-sizing: border-box;
+                padding: 6px 8px;
+                border: 1px solid #d0d7de;
+                border-radius: 6px;
+                font-size: 14px;
+                outline: none;
+                background: #fff;
+                color: #1f2328;
+            ">
+            <div id="searchResult" style="margin-top: 10px; font-size: 14px; line-height: 1.6; color: #1f2328; min-height: 20px;"></div>
+        </div>
+    `;
+    document.documentElement.appendChild(searchPanel);
+
+    const toggleBtn = searchPanel.querySelector('#searchToggle');
+    const searchBody = searchPanel.querySelector('#searchBody');
+    const wordInput = searchPanel.querySelector('#wordInput');
+    const searchResult = searchPanel.querySelector('#searchResult');
+    let panelOpen = false;
+
+    // 搜索框展开/收起
+    toggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        panelOpen = !panelOpen;
+        if (panelOpen) {
+            searchPanel.style.width = '300px';
+            searchPanel.style.height = 'auto';
+            searchBody.style.display = 'block';
+            setTimeout(() => wordInput.focus(), 100);
+        } else {
+            searchPanel.style.width = '40px';
+            searchPanel.style.height = '40px';
+            searchBody.style.display = 'none';
+            searchResult.innerHTML = '';
+        }
+    });
+
+    // 搜索框回车查询
+    wordInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            const word = wordInput.value.trim().toLowerCase();
+            if (!word) return;
+            searchWord(word);
+        }
+    });
+
+    // 点击搜索面板不冒泡关闭
+    searchPanel.addEventListener('mousedown', (e) => e.stopPropagation());
+
+    // ========== 核心查词逻辑 ==========
+    const wordReg = /^[a-zA-Z]+$/;
+
+    function fetchWordData(word) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: "https://dict.youdao.com/jsonapi?q=" + encodeURIComponent(word),
+                timeout: 8000,
+                onload: function(res) {
+                    try {
+                        const data = JSON.parse(res.responseText);
+                        resolve(data);
+                    } catch (e) {
+                        reject(e);
+                    }
+                },
+                onerror: reject,
+                ontimeout: reject
+            });
+        });
+    }
+
+    function renderResult(word, data) {
+        let translation = '暂无释义';
+        let usPh = '';
+        let ukPh = '';
+
+        // 提取音标
+        const simpleWord = data.simple?.word?.[0];
+        if (simpleWord) {
+            usPh = simpleWord.usphone || '';
+            ukPh = simpleWord.ukphone || '';
+        }
+
+        // 提取释义（优先词典释义）
+        if (data.ec && data.ec.word && data.ec.word.length > 0) {
+            const meanings = [];
+            data.ec.word.forEach(item => {
+                if (item.trs?.length > 0) {
+                    item.trs.forEach(trItem => {
+                        trItem.tr?.forEach(t => {
+                            t.l?.i?.forEach(i => meanings.push(i));
+                        });
+                    });
+                }
+            });
+            if (meanings.length > 0) translation = meanings.join('；');
+        } else if (data.expand_ec?.word?.length > 0) {
+            translation = data.expand_ec.word.map(t => t.trans).join('；');
+        } else if (data.web_trans?.['web-translation']?.length) {
+            translation = data.web_trans['web-translation'][0].value;
+        }
+
+        // 组装音标HTML
+        let phoneticHtml = '';
+        if (usPh || ukPh) {
+            phoneticHtml = '<div style="font-size:13px; color:#666; margin:4px 0;">';
+            if (usPh) {
+                phoneticHtml += `<span class="us-phonetic" style="cursor:pointer; margin-right:14px;" title="点击播放美音">美 /${usPh}/</span>`;
+            }
+            if (ukPh) {
+                phoneticHtml += `<span class="uk-phonetic" style="cursor:pointer;" title="点击播放英音">英 /${ukPh}/</span>`;
+            }
+            phoneticHtml += '</div>';
+        }
+
+        return `
+            <div style="font-weight: bold; font-size: 15px;">${word}</div>
+            ${phoneticHtml}
+            <div style="margin-top: 4px;">${translation}</div>
+        `;
+    }
+
+    // 划词弹窗查词 + 自动播放美音
+    function lookupWord(word, x, y) {
+        if (!word || !wordReg.test(word) || word.length > 30 || word.length < 2) {
+            tip.style.display = 'none';
+            return;
+        }
+
+        // 边界自适应
+        let left = x + 12;
+        let top = y + 8;
+        if (left + 320 > window.innerWidth) left = x - 332;
+        if (top + 160 > window.innerHeight) {
+            top = y - 8;
+            tip.style.transform = 'translateY(-100%)';
+        } else {
+            tip.style.transform = 'none';
+        }
+
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+        tip.innerHTML = `<div style="font-weight: bold; font-size: 15px;">${word}</div><div style="color:#999; font-size:13px; margin:2px 0;">⏳ 查询中...</div>`;
+        tip.style.display = 'block';
+
+        fetchWordData(word).then(data => {
+            tip.innerHTML = renderResult(word, data);
+            bindPhoneticEvents(tip, word);
+            // ===== 新增：划词成功自动播放一次美音 =====
+            playWordAudio(word, 2);
+        }).catch(() => {
+            tip.innerHTML = `<div style="font-weight:bold;">${word}</div><div style="color:#e74c3c; margin-top:4px;">❌ 查询失败</div>`;
+        });
+    }
+
+    // 搜索框查词
+    function searchWord(word) {
+        searchResult.innerHTML = '<div style="color:#999;">⏳ 查询中...</div>';
+        fetchWordData(word).then(data => {
+            searchResult.innerHTML = renderResult(word, data);
+            bindPhoneticEvents(searchResult, word);
+            // 搜索也自动播一次
+            playWordAudio(word, 2);
+        }).catch(() => {
+            searchResult.innerHTML = '<div style="color:#e74c3c;">❌ 查询失败，请检查网络</div>';
+        });
+    }
+
+    // ========== 全局事件绑定 ==========
+    // 拖动选词触发
+    document.addEventListener('mouseup', function() {
+        setTimeout(() => {
+            const sel = window.getSelection();
+            const text = sel.toString().trim();
+            if (text) {
+                const range = sel.getRangeAt(0);
+                const rect = range.getBoundingClientRect();
+                lookupWord(text, rect.right, rect.bottom);
+            }
+        }, 0);
+    }, true);
+
+    // 双击单词快速查词
+    document.addEventListener('dblclick', function(e) {
+        const sel = window.getSelection();
+        const text = sel.toString().trim();
+        if (text && wordReg.test(text)) {
+            lookupWord(text, e.clientX, e.clientY);
+        }
+    }, true);
+
+    // 点击空白关闭弹窗 + 收起搜索框
+    document.addEventListener('mousedown', function() {
+        tip.style.display = 'none';
+        if (panelOpen) {
+            panelOpen = false;
+            searchPanel.style.width = '40px';
+            searchPanel.style.height = '40px';
+            searchBody.style.display = 'none';
+        }
+    }, true);
+})();
+
+
+
+
